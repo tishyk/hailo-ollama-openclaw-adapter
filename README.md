@@ -147,9 +147,8 @@ Add or modify a provider:
 Important: Use port 11435
 
 ### 6. Restart OpenClaw gateway
-
+#### Example – adjust to your setup
 ``` bash
-# Example – adjust to your setup
 openclaw gateway restart
 ```
 
