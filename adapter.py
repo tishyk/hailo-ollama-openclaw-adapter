@@ -9,14 +9,13 @@ app = FastAPI()
 # Point to  Hailo-Ollama service
 HAILO_URL = "http://127.0.0.1:8000/api/chat"
 
-MAX_HISTORY = 3 # Increased slightly to give the model more context
+MAX_HISTORY = 2 # Could be 3 for Hailo MZ GEN AI 5.1.1 version
 
 FULL_TOOLING = """Tools available for this request:
 - read: Read file contents
 - write: Create or overwrite files
 - exec: Run shell commands (PTY available)
-- web_search: Search the web (Brave API)
-- canvas: Present/eval/snapshot the Canvas""" # Paste your tooling string here if needed
+- web_search: Search the web (Brave API)""" # Paste your tooling string here if needed
 
 def build_system_message(request_requires_tools=False):
     base = "You are a personal assistant running inside OpenClaw. Use short answers"
