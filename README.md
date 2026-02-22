@@ -1,13 +1,15 @@
-# Hailo-Ollama + OpenClaw Adapter
+# Hailo-Ollama + OpenClaw Adapter for Raspberry Pi (AI HAT+ / Hailo-10)
 
-<image-card alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-blue?logo=python&logoColor=white" ></image-card>
-<image-card alt="Hailo Model Zoo GenAI" src="https://img.shields.io/badge/Hailo%20Model%20Zoo%20GenAI-5.1.1%20%26%205.2.0-success" ></image-card>
+![Python 3.13](https://img.shields.io/badge/python-3.13-blue?logo=python&logoColor=white)
+![Supports Hailo Model Zoo GenAI 5.1.1 & 5.2.0](https://img.shields.io/badge/Hailo%20Model%20Zoo%20GenAI-5.1.1%20%26%205.2.0-success)
 
-Lightweight FastAPI adapter that makes Hailo-Ollama (Hailo Model Zoo GenAI 5.1.1 & 5.2.0) compatible with OpenClaw on Raspberry Pi with Hailo accelerators (AI HAT+2, Hailo-10, etc.).
+This repository provides a simple **FastAPI-based adapter** that bridges **Hailo-Ollama** (running on Hailo AI accelerators like AI HAT+2 or Hailo-10) with **OpenClaw**, enabling fast, local, privacy-focused LLM inference on Raspberry Pi 5.
+
+**Tested and supported with Hailo Model Zoo GenAI (official name) versions 5.1.1 and 5.2.0** — the standard releases for Hailo-10H / Hailo-10 compatible setups, including HailoRT 5.1.1 & 5.2.0.
 
 ## Why this adapter is needed
 
-Hailo-Ollama does not expose the exact /v1/chat/completions endpoint in the format OpenClaw expects by default.
+Hailo-Ollama does **not** natively support the exact OpenAI `/v1/chat/completions` endpoint and response format that OpenClaw expects by default.
 
 This proxy:
 - Listens on port 11435 (recommended)
