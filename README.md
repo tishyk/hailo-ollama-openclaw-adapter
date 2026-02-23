@@ -1,4 +1,4 @@
-# Hailo-Ollama + OpenClaw Adapter for Raspberry Pi (AI HAT+2 / Hailo-10)
+# Hailo-Ollama + OpenClaw Adapter for Hailo-10 chip
 
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue?logo=python&logoColor=white)
 ![Supports Hailo Model Zoo GenAI 5.1.1 & 5.2.0](https://img.shields.io/badge/Hailo%20Model%20Zoo%20GenAI-5.1.1%20%26%205.2.0-success)
