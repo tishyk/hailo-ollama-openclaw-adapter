@@ -1,228 +1,468 @@
-# Hailo-Ollama + OpenClaw Adapter for Hailo-10 chip
+# Hailo-Ollama to OpenClaw Adapter
 
-![Python 3.13](https://img.shields.io/badge/python-3.13-blue?logo=python&logoColor=white)
-![Supports Hailo Model Zoo GenAI 5.1.1 & 5.2.0](https://img.shields.io/badge/Hailo%20Model%20Zoo%20GenAI-5.1.1%20%26%205.2.0-success)
+![HailoRT](https://img.shields.io/badge/HailoRT-5.3.0-success)
+![Ollama](https://img.shields.io/badge/Ollama-0.6.0-blue)
+![OpenClaw](https://img.shields.io/badge/OpenClaw-2026.04.20-orange)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%205-red)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 
-This repository provides a simple **FastAPI-based adapter** that bridges **Hailo-Ollama** (running on Hailo AI accelerators like AI HAT+2 or Hailo-10) with **OpenClaw**, enabling fast, local, privacy-focused LLM inference on Raspberry Pi 5.
 
-**Tested and supported with Hailo Model Zoo GenAI (official name) versions 5.1.1 and 5.2.0** — the standard releases for Hailo-10H / Hailo-10 compatible setups, including HailoRT 5.1.1 & 5.2.0.
+A FastAPI adapter that bridges [Hailo-Ollama](https://hailo.ai/) with [OpenClaw](https://openclaw.ai/) by
+exposing OpenAI- and Ollama-compatible HTTP endpoints.
 
-## Why this adapter is needed
+Built and tested on **Raspberry Pi 5 with Hailo-10H running Raspberry Pi
+OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
 
-Hailo-Ollama does **not** natively support the exact OpenAI `/v1/chat/completions` endpoint and response format that OpenClaw expects by default.
+<p align="center">
+  <img src="docs/images/openclaw-dashboard.jpg" alt="OpenClaw dashboard chatting with qwen3 via Hailo" width="800">
+  <br>
+  <em>OpenClaw dashboard chatting with <code>qwen3:1.7b</code> accelerated on Hailo-10H</em>
+</p>
 
-This proxy:
-- Listens on port 11435 (recommended)
-- Forwards trimmed requests to Hailo-Ollama /api/chat (port 8000)
-- Keeps only the last user message → avoids context overflow
-- Converts Hailo-Ollama response to OpenAI-compatible format
+---
 
-Works with OpenClaw dashboard and messengers (Telegram, etc.).
+## What this adapter does
 
-## Prerequisites
+OpenClaw talks to language-model providers using the Ollama or OpenAI
+wire protocols. Hailo-Ollama exposes its own HTTP API on port 8000 that
+is close to, but not quite, Ollama-compatible. This adapter sits between
+them on port 11435 and translates:
 
-- Raspberry Pi 5 (64-bit OS recommended)
-- Hailo drivers & platform installed
-- Hailo-Ollama running on default port 8000
-  - Compatible with Hailo Model Zoo GenAI 5.1.1 and 5.2.0
-  - At least one model pulled (example: qwen:1.5b, llama-3.2:1b, …)
-- OpenClaw installed and dashboard working
-- Python 3.13 (Trixie default)
+- OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
+- adapter -> Hailo (sanitized JSON, model list from `/hailo/v1/list`)
 
-## Setup Steps
+It also handles three Hailo 5.3.0 changes that would otherwise break the
+conversation: strict JSON parsing (control chars rejected), newline-in-
+content rejection, and the system-role-on-continuation restriction.
 
-### 1. Clone the repository
+---
 
-``` bash
-git clone https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
-cd hailo-ollama-openclaw-adapter
+## Why this version
+
+Earlier adapter builds in this repo used OpenClaw's `openai-completions`
+provider and spoke to Hailo-Ollama using the OpenAI chat-completions
+wire format. That worked for a while, but several things broke together
+around Hailo Model Zoo GenAI 5.3.0 and the OpenClaw 2026.4.x series:
+
+- **Wire protocol changed on both sides.** OpenClaw rebuilt its Ollama
+  integration to use the native Ollama transport end-to-end, making
+  `openai-completions` the slower/second-class path. Hailo 5.3.0 in
+  parallel tightened its JSON parser and introduced new validation
+  rules. Gluing an OpenAI-shaped request through to a stricter Hailo
+  started producing silent 400s and partial responses.
+- **Hailo 5.3.0 prompt-renderer bugs.** Control characters in strings,
+  literal newlines inside user content, and system-role messages on
+  conversation continuations all became hard errors rather than being
+  silently tolerated. The old adapter had no sanitization for any of
+  these because they hadn't mattered on 5.1.x / 5.2.x.
+- **Dynamic model discovery.** This version queries `/hailo/v1/list` at startup,
+  caches the result, and exposes the full set during the openclaw model setup.
+- **Backpressure handled at the app layer.** The old adapter relied on
+  uvicorn's `--limit-concurrency` for backpressure, which 503'd probe
+  endpoints during OpenClaw's startup burst of `/api/show` calls. This
+  version uses an `asyncio.Semaphore` that gates only the chat path;
+  probes always succeed from the in-memory cache.
+- **Graceful streaming shutdown.** Hailo's ~13-second generation
+  timeout used to surface as a 100-line ASGI traceback. Now it's caught
+  and logged as a single warning.
+- **Installable package.** You can now `pip3 install` directly from
+  GitHub and get a `hailo-ollama-adapter` command, rather than cloning
+  and running `uvicorn` against a loose file.
+
+The `main` branch and the `2026.04.20` tag reflect this rewrite. If you
+find an older fork or gist that uses `api: "openai-completions"` in
+OpenClaw's config or a hardcoded model list, it predates these changes
+and won't work against current Hailo-Ollama or current OpenClaw.
+
+---
+
+## Requirements
+
+- **Raspberry Pi 5** with **Hailo-10H** accelerator (PCIe M.2 HAT)
+- **Raspberry Pi OS (Debian 13 "Trixie")**, 64-bit
+- **Python 3.10+** (ships with Trixie)
+- **Hailo-Ollama** installed and reachable on `http://127.0.0.1:8000`
+- **OpenClaw** CLI installed (`pnpm add -g openclaw@2026.04.20`)
+
+---
+
+## Before you start - order matters
+
+Start the pieces in this order:
+
+1. **Hailo-Ollama server** (port 8000) - must be running first
+2. **Pull at least one model** so the adapter has something to report
+3. **The adapter** (port 11435) - reads the model list from Hailo-Ollama
+4. **OpenClaw onboarding** - probes the adapter on 11435
+
+If you skip step 2, the adapter's startup probe returns an empty list
+and falls back to a single `qwen3:1.7b` placeholder. If you do step 4
+before step 3, OpenClaw has nothing to probe.
+
+### 1. Start Hailo-Ollama
+
+Start the Hailo-Ollama server per Hailo's documentation. Verify it's
+listening on port 8000:
+
+```bash
+curl -s http://127.0.0.1:8000/hailo/v1/list
 ```
 
-### 2. Create & activate virtual environment
+You should get a list of models for a pull including default `qwen3:1.7b`.
 
-``` bash
+### 2. Pull a model into Hailo-Ollama
+
+The adapter discovers whatever models Hailo-Ollama has pulled. You need
+at least one. `qwen3:1.7b` is small enough to run comfortably on a Pi 5:
+
+```bash
+curl --silent http://127.0.0.1:8000/api/pull \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3:1.7b", "stream": true}'
+```
+
+The pull streams progress until it finishes. To pull additional models,
+repeat with a different `model` value. Verify what's available:
+
+```bash
+curl -s http://127.0.0.1:8000/hailo/v1/list
+```
+
+### 3. Install OpenClaw 2026.04.20
+
+Later OpenClaw releases introduced breaking changes in the concurrency
+handling and auth-profile schema. Pin to `2026.04.20` for a stable setup:
+
+```bash
+# npm
+npm install -g openclaw@2026.04.20
+
+# pnpm (recommended - fewer native-build hiccups)
+pnpm add -g openclaw@2026.04.20
+```
+
+Verify:
+
+```bash
+openclaw --version
+# should print 2026.04.20
+```
+
+If `pnpm` complains about missing channel plugin dependencies after
+install, add them explicitly:
+
+```bash
+pnpm add -g @larksuiteoapi/node-sdk @buape/carbon grammy \
+  @grammyjs/runner @grammyjs/transformer-throttler \
+  @slack/web-api @slack/bolt @slack/logger nostr-tools
+
+pnpm approve-builds -g
+```
+
+---
+
+## Installation
+
+Inside a Python 3.10+ virtualenv or existing SW Bundle hailo_venv can be used (DFC packages conflicts exists):
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
+
+pip3 install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
 ```
 
-### 3. Install dependencies
+This installs the `hailo-ollama-adapter` command into your venv.
 
-``` bash
-pip install -r requirements.txt
-# or:
-# pip install fastapi uvicorn requests
+For a specific release:
+
+```bash
+pip3 install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git@2026.04.20
 ```
 
-### 4. (Optional) Review adapter.py
+### Clone for development
 
-Open adapter.py in your preferred text editor (nano, vim, VS Code, etc.) and check or adjust the following parts if needed:
+If you want to modify the adapter or run tests:
 
-- The Hailo-Ollama endpoint URL:
+```bash
+git clone https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
+cd hailo-ollama-openclaw-adapter
 
-``` python
-hailo_url = "http://localhost:8000/api/chat"
-```
-
-Change the port (8000) if your Hailo-Ollama server is running on a different one.
-
-- Context trimming logic (currently keeps only the latest user message):
-
-``` python
-if "messages" in data and isinstance(data["messages"], list):
-    user_messages = [msg for msg in data["messages"] if msg.get("role") == "user"]
-    if user_messages:
-        data["messages"] = [user_messages[-1]]  # just the latest user input
-```
-
-- Response formatting section (makes Hailo-Ollama output look like a standard OpenAI response):
-
-``` python
-content = hailo_data.get("response", hailo_data.get("content", "No response from model"))
-
-formatted = {
-    "id": f"chatcmpl-{int(time.time())}",
-    "object": "chat.completion",
-    "created": int(time.time()),
-    "model": data.get("model", "hailo-model"),
-    "choices": [{
-        "index": 0,
-        "message": {"role": "assistant", "content": content},
-        "finish_reason": "stop"
-    }],
-    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}  # dummy values
-}
-
-```
-
-Save the file if you made any changes.
-
-This step is optional — the default code already works for most users.
-
-### 5. Update openclaw.json
-
-Find your openclaw.json (usually ~/.openclaw/ or in install folder).
-
-**Caution!**
-Add openclaw.json file backup first!
-
-Add or modify a provider:
-
-``` json
-"models": {
-    "providers": {
-      "hailo-ollama": {
-        "baseUrl": "http://127.0.0.1:11435",
-        "apiKey": "ollama-local",
-        "api": "openai-completions",
-	"models": [
-          {
-            "id": "qwen2:1.5b",
-            "name": "Hailo qwen2:1.5b",
-            "reasoning": false,
-            "input": [
-              "text"
-            ],
-            "cost": {
-              "input": 0,
-              "output": 0,
-              "cacheRead": 0,
-              "cacheWrite": 0
-            },
-            "contextWindow": 131072,
-            "maxTokens": 16394
-          }
-        ]
-      }
-    }
-
-...
-
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "hailo-ollama/qwen2:1.5b"
-      },
-```
-
-Important: Use port 11435
-
-### 6. Restart OpenClaw gateway
-#### Example – adjust to your setup
-``` bash
-openclaw gateway restart
-```
-
-Check logs for errors related to config or port 11435.
-
-### 7. Start the adapter
-
-(Inside the venv folder)
-
-``` bash
+python3 -m venv venv
 source venv/bin/activate
-uvicorn adapter:app --host 0.0.0.0 --port 11435 --timeout-keep-alive 240 --limit-concurrency 2
+pip3 install -e ".[dev]"
 ```
 
-Recommended: run in tmux, screen, or as systemd service.
+`-e` is editable mode - code changes take effect without reinstall.
+`[dev]` pulls in `ruff`, `pytest`, and `pytest-asyncio` for local testing.
 
-### 8. Start / confirm Hailo-Ollama
+---
 
-In a separate terminal:
+## Running the adapter
 
-``` bash
-hailo-ollama
+Check hailo-ollama server is up and running. 
+Open a terminal and run any of these (they're all equivalent):
+
+```bash
+source venv/bin/activate
+
+# Simplest
+hailo-ollama-adapter
+
+# Python module form
+python -m hailo_ollama_adapter
+
+# Raw uvicorn (for custom uvicorn flags)
+uvicorn hailo_ollama_adapter.adapter:app --host 0.0.0.0 --port 11435
 ```
 
-Make sure it's listening on http://localhost:8000
+All three default to binding `0.0.0.0:11435` with a 240-second keep-alive.
 
-### 9. Test in OpenClaw Dashboard
+Leave the terminal open while using OpenClaw. Press `Ctrl+C` to stop the
+adapter when done.
 
-1. Open dashboard
-``` bash
+### CLI options
+
+```bash
+hailo-ollama-adapter --help
+
+  --host HOST                        default: 0.0.0.0
+  --port PORT                        default: 11435
+  --timeout-keep-alive SECONDS       default: 240
+  --limit-concurrency N              default: 2
+  --log-level LEVEL                  default: info
+  --reload                           auto-reload on source changes (dev)
+```
+
+### Verify it's working
+
+In a second terminal:
+
+```bash
+# Should list the models your Hailo-Ollama has pulled
+curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
+```
+
+If Hailo-Ollama is still starting when the adapter launches, the adapter
+retries up to 10 times with 2-second delays before falling back to a
+single default model entry. You can force a refresh at any time:
+
+```bash
+curl -s -X POST http://127.0.0.1:11435/api/tags/refresh
+```
+
+---
+
+## Configuring OpenClaw
+
+Before running onboarding, make sure:
+
+- Hailo-Ollama is running on port 8000
+- At least one model is pulled (see **Before you start** above)
+- The adapter is running on port 11435 (Terminal 1 from the previous step)
+
+Open a **second terminal** and run OpenClaw's interactive onboarding.
+This wires up the gateway, the adapter endpoint, and your default model.
+
+```bash
+openclaw onboard --install-daemon
+```
+
+### Step 1 - Accept the security prompt and pick QuickStart
+
+Type `Yes` to accept the personal-by-default prompt, then choose
+**QuickStart** as the setup mode. If an existing config is detected,
+select **Update values**.
+
+<p align="center">
+  <img src="docs/images/setup-quickstart.jpg" alt="OpenClaw QuickStart setup" width="800">
+</p>
+
+### Step 2 - Pick Ollama as the model provider
+
+Arrow down to **Ollama (Cloud and local open models)** and hit Enter.
+
+<p align="center">
+  <img src="docs/images/setup-provider-ollama.jpg" alt="Selecting Ollama as provider" width="700">
+</p>
+
+### Step 3 - Point to the adapter and pick a default model
+
+- **Ollama mode**: `Local only`
+- **Ollama base URL**: `http://127.0.0.1:11435` (the **adapter**, not
+  Hailo-Ollama directly - adapter runs on 11435, Hailo on 8000)
+- **Default model**: pick any model from the list. This list is fetched
+  live from Hailo-Ollama through the adapter. `qwen3:1.7b` is a sensible
+  starter.
+
+<p align="center">
+  <img src="docs/images/setup-model-picker.jpg" alt="Model picker with live Hailo models" width="900">
+</p>
+
+The right-hand pane shows the adapter serving `/api/tags` and `/api/show`
+requests as OpenClaw probes it. 200 OKs everywhere = healthy.
+
+### Step 4 - Finish onboarding and open the dashboard
+
+When onboarding finishes, you'll see the completion screen with the
+dashboard link.
+
+<p align="center">
+  <img src="docs/images/setup-complete.jpg" alt="Onboarding complete screen" width="700">
+</p>
+
+Open the dashboard:
+
+```bash
 openclaw dashboard
 ```
-3. Go to Agents / Models / Providers
-4. Look for hailo-ollama-local — it should appear and be available
-5. Go to Chat
-6. Select the Hailo provider
-7. Type: Hello! Tell me a short joke about AI hats.
 
-You should get a quick response using Hailo acceleration.
+### Step 5 - Chat with your Hailo-accelerated model
+
+The dashboard opens in your browser. Start chatting - responses come from
+`qwen3:1.7b` (or whichever model you picked) running on the Hailo-10H
+accelerator.
+
+<p align="center">
+  <img src="docs/images/openclaw-dashboard.jpg" alt="OpenClaw dashboard in action" width="900">
+</p>
+
+### Daily use
+
+Once configured, each time you want to use OpenClaw with Hailo:
+
+```bash
+# 1. Make sure Hailo-Ollama is running on port 8000
+curl -s http://127.0.0.1:8000/hailo/v1/list  # quick health check
+
+# 2. Terminal 1: start the adapter
+source ~/hailo-ollama-openclaw-adapter/venv/bin/activate
+hailo-ollama-adapter
+
+# 3. Terminal 2: open the dashboard
+openclaw dashboard
+```
+
+Press `Ctrl+C` in the adapter terminal when you're done.
+
+---
+
+## Endpoints
+
+| Method | Path                              | Purpose                                    |
+|--------|-----------------------------------|--------------------------------------------|
+| GET    | `/api/tags`                       | Ollama model list (from Hailo cache)       |
+| POST   | `/api/tags/refresh`               | Force refresh of the model list            |
+| POST   | `/api/show`                       | Ollama model details                       |
+| POST   | `/api/chat`                       | Ollama chat endpoint                       |
+| POST   | `/chat/completions`               | OpenAI-compatible chat endpoint            |
+| POST   | `/v1/chat/completions`            | OpenAI-compatible chat (alt path)          |
+| POST   | `/api/chat/completions`           | OpenAI-compatible chat (alt path)          |
+
+All chat endpoints honor the `model` field in the request body - whatever
+OpenClaw picks in the dashboard gets forwarded to Hailo-Ollama verbatim.
+
+---
+
+## Configuration knobs
+
+Edit these constants at the top of `src/hailo_ollama_adapter/adapter.py`
+(or fork and patch to taste):
+
+```python
+HAILO_MODEL = "qwen3:1.7b"          # fallback when Hailo is unreachable
+HAILO_URL = "http://127.0.0.1:8000/api/chat"
+HAILO_LIST_URL = "http://127.0.0.1:8000/hailo/v1/list"
+
+REQUEST_TIMEOUT = 180.0             # seconds for a single Hailo chat call
+LIST_TIMEOUT = 5.0                  # seconds for the list probe
+STARTUP_RETRY_ATTEMPTS = 10         # how many times to retry at boot
+STARTUP_RETRY_DELAY = 2.0           # seconds between retries
+MAX_USER_CONTENT_CHARS = 4000       # truncate long user messages
+MAX_EXTRACTED_INTENT_CHARS = 500    # OpenClaw bootstrap envelope trim
+MAX_HISTORY_TURNS = 6               # how many prior turns to keep
+MAX_CONCURRENT_HAILO_CALLS = 2      # app-level backpressure
+```
+
+The concurrency limit is enforced inside the adapter with an
+`asyncio.Semaphore` - probe endpoints (`/api/tags`, `/api/show`) aren't
+subject to it and always respond instantly from cache. Only the chat
+path is gated.
+
+---
 
 ## Troubleshooting
 
-- Provider missing → check JSON syntax, restart gateway
-- Adapter receives nothing → wrong baseUrl (must point to 11435)
-- Hailo timeouts → smaller model, check Hailo-Ollama logs
-- Context problems → adapter already limits to the last message
+**`Hailo-Ollama still unreachable after 10 attempts`** - The adapter
+started before Hailo-Ollama was ready. Either start Hailo-Ollama first
+or `POST /api/tags/refresh` once Hailo is up.
 
-## Optional: systemd service
+**OpenClaw dashboard shows only one model** - The adapter is serving its
+fallback. Check `curl http://127.0.0.1:8000/hailo/v1/list` returns your
+pulled models, then `POST /api/tags/refresh` on the adapter.
 
-File: /etc/systemd/system/hailo-openclaw-adapter.service
+**`peer closed connection without sending complete message body`** -
+Hailo's internal generation timeout fired (around 13 seconds with heavy
+context). Reduce `MAX_HISTORY_TURNS` or switch to a smaller/faster model.
 
-``` ini
-[Unit]
-Description=Hailo-Ollama → OpenClaw Adapter
-After=network.target
+**`[Bootstrap pending]` scaffolding keeps appearing in replies** - Delete
+`~/.openclaw/workspace/BOOTSTRAP.md` after onboarding. OpenClaw treats
+the file's presence as "bootstrap pending".
 
-[Service]
-User=pi
-WorkingDirectory=/home/pi/hailo-ollama-openclaw-adapter
-ExecStart=/home/pi/hailo-ollama-openclaw-adapter/venv/bin/uvicorn adapter:app --host 0.0.0.0 --port 11435 --timeout-keep-alive 240 --limit-concurrency 2
-Restart=always
+**Small model (1.7B) can't hold persona or remember names well** - This
+is the model's capability limit, not an adapter bug. Use a larger Hailo
+model or switch to a cloud provider for agent-heavy work, keep the Hailo
+model for quick chat.
 
-[Install]
-WantedBy=multi-user.target
+---
+
+## Development
+
+```bash
+# Lint
+ruff check src/
+
+# Auto-fix style issues
+ruff check --fix src/
+
+# Run tests (when added)
+pytest
 ```
 
-Then run:
+The adapter passes the following ruff rule sets clean:
+`E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, `SIM`, `G`.
 
-``` bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now hailo-openclaw-adapter.service
-sudo systemctl status hailo-openclaw-adapter
+---
+
+## Versioning
+
+When bumping the version, update **three** files in lockstep:
+
+- `pyproject.toml` -> `version = "X.Y.Z"`
+- `setup.py` -> `version="X.Y.Z"`
+- `src/hailo_ollama_adapter/__init__.py` -> `__version__ = "X.Y.Z"`
+
+Tag the release:
+
+```bash
+git tag -a vX.Y.Z -m "Release X.Y.Z"
+git push origin vX.Y.Z
 ```
 
-MIT License
+---
 
-Happy local accelerated AI on Raspberry Pi! 🚀
+## License
+
+MIT - see [LICENSE](LICENSE).
+
+---
+
+## Acknowledgments
+
+- [Hailo](https://hailo.ai/) for the Hailo-10H accelerator and
+  Hailo-Ollama runtime
+- [OpenClaw](https://openclaw.ai/) for the local-first agent framework
+- [FastAPI](https://fastapi.tiangolo.com/),
+  [httpx](https://www.python-httpx.org/), and
+  [uvicorn](https://www.uvicorn.org/) for the HTTP stack
