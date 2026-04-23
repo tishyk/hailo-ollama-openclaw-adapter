@@ -8,10 +8,8 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 
-A FastAPI adapter that bridges [Hailo-Ollama](https://hailo.ai/) (running
-on a Hailo AI accelerator) with [OpenClaw](https://openclaw.ai/) by
-exposing OpenAI- and Ollama-compatible HTTP endpoints and working around
-Hailo 5.3.0 prompt-renderer quirks.
+A FastAPI adapter that bridges [Hailo-Ollama](https://hailo.ai/) with [OpenClaw](https://openclaw.ai/) by
+exposing OpenAI- and Ollama-compatible HTTP endpoints.
 
 Built and tested on **Raspberry Pi 5 with Hailo-10H running Raspberry Pi
 OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
@@ -34,7 +32,7 @@ them on port 11435 and translates:
 - OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
 - adapter -> Hailo (sanitized JSON, model list from `/hailo/v1/list`)
 
-It also handles three Hailo 5.3.0 quirks that would otherwise break the
+It also handles three Hailo 5.3.0 changes that would otherwise break the
 conversation: strict JSON parsing (control chars rejected), newline-in-
 content rejection, and the system-role-on-continuation restriction.
 
@@ -232,7 +230,7 @@ hailo-ollama-adapter --help
   --host HOST                        default: 0.0.0.0
   --port PORT                        default: 11435
   --timeout-keep-alive SECONDS       default: 240
-  --limit-concurrency N              default: unlimited
+  --limit-concurrency N              default: 2
   --log-level LEVEL                  default: info
   --reload                           auto-reload on source changes (dev)
 ```
