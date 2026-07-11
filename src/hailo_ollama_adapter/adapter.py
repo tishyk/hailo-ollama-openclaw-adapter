@@ -483,6 +483,28 @@ async def chat_completions(request: Request) -> Any:
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
+@app.get("/models")
+@app.get("/v1/models")
+async def list_models() -> dict:
+    """List available models (OpenAI-compatible endpoint)."""
+    models = await _get_models()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model["name"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "hailo",
+                "permission": [],
+                "root": model["name"],
+                "parent": None,
+            }
+            for model in models
+        ],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Ollama-compatible endpoints
 # --------------------------------------------------------------------------- #
