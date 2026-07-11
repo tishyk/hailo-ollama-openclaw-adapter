@@ -10,7 +10,7 @@ import uvicorn
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hailo-ollama-adapter",
-        description="Hailo-Ollama to OpenClaw adapter server.",
+        description="Hailo-Ollama to Hermes adapter server.",
     )
     parser.add_argument(
         "--host",
