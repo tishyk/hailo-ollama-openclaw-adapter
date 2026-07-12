@@ -485,6 +485,7 @@ async def chat_completions(request: Request) -> Any:
 
 @app.get("/models")
 @app.get("/v1/models")
+@app.get("/api/v1/models")
 async def list_models() -> dict:
     """List available models (OpenAI-compatible endpoint)."""
     models = await _get_models()
@@ -507,6 +508,7 @@ async def list_models() -> dict:
 
 @app.get("/models/{model_id}")
 @app.get("/v1/models/{model_id}")
+@app.get("/api/v1/models/{model_id}")
 async def get_model(model_id: str) -> dict:
     """Return a single model object matching model_id (OpenAI-compatible).
 
