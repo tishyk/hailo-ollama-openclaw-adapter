@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 HAILO_DEFAULT_MODEL = "qwen3:1.7b"
 HAILO_URL = "http://127.0.0.1:8000/api/chat"
-HAILO_LIST_URL = "http://127.0.0.1:8000/hailo/v1/list"
+HAILO_LIST_URL = "http://127.0.0.1:8000/api/tags"
 HAILO_HEADERS = {"Content-Type": "application/json"}
 
 REQUEST_TIMEOUT = 180.0
@@ -39,6 +39,7 @@ MAX_USER_CONTENT_CHARS = 2000
 MAX_EXTRACTED_INTENT_CHARS = 500
 MAX_HISTORY_TURNS = 12
 MAX_CONCURRENT_HAILO_CALLS = 2
+MAX_UPSTREAM_ERROR_CHARS = 500
 
 FULL_TOOLING = """Tools available for this request:
 - read: Read file contents
@@ -70,6 +71,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 async def _preload_models_with_retry() -> None:
+    """Populate the model cache after bounded startup retries."""
     for attempt in range(1, STARTUP_RETRY_ATTEMPTS + 1):
         try:
             async with httpx.AsyncClient() as client:
@@ -85,8 +87,10 @@ async def _preload_models_with_retry() -> None:
                 await asyncio.sleep(STARTUP_RETRY_DELAY)
                 continue
             logger.warning(
-                f"Hailo-Ollama still unreachable after %d attempts. Check hailo-ollama server started and restart or default {HAILO_DEFAULT_MODEL} model will be used",
+                "Hailo-Ollama still unreachable after %d attempts. "
+                "Check that the server is running; default %s will be used",
                 STARTUP_RETRY_ATTEMPTS,
+                HAILO_DEFAULT_MODEL,
             )
             models = [_DEFAULT_MODEL_INFO]
         else:
@@ -265,6 +269,35 @@ def _ollama_full_response(content: str, model: str) -> dict:
     }
 
 
+def _upstream_error_detail(response: httpx.Response) -> str:
+    """Extract a bounded explicit error without reflecting arbitrary bodies."""
+    detail: Any = None
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        detail = payload.get("error") or payload.get("detail")
+        if isinstance(detail, dict):
+            detail = detail.get("message")
+
+    if not isinstance(detail, str) or not detail.strip():
+        return f"Hailo upstream returned HTTP {response.status_code}"
+
+    return _flatten_newlines(_sanitize(detail)).strip()[:MAX_UPSTREAM_ERROR_CHARS]
+
+
+def _upstream_error_response(exc: httpx.HTTPStatusError) -> JSONResponse:
+    """Preserve Hailo's status with a bounded downstream error response."""
+    status = exc.response.status_code
+    logger.warning("Hailo upstream rejected chat request: status=%d", status)
+    return JSONResponse(
+        status_code=status,
+        content={"error": _upstream_error_detail(exc.response)},
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Hailo client
 # --------------------------------------------------------------------------- #
@@ -287,6 +320,7 @@ def _build_payload(
 
 
 async def _post_hailo(body: bytes) -> dict:
+    """Send one non-streaming request while holding the Hailo chat slot."""
     async with _hailo_semaphore, httpx.AsyncClient() as client:
         response = await client.post(
             HAILO_URL,
@@ -294,6 +328,7 @@ async def _post_hailo(body: bytes) -> dict:
             headers=HAILO_HEADERS,
             timeout=REQUEST_TIMEOUT,
         )
+        response.raise_for_status()
     return response.json()
 
 
@@ -356,7 +391,7 @@ def _infer_family(name: str) -> str:
     return name.split(":", 1)[0] if ":" in name else name
 
 
-def _normalize_HAILO_DEFAULT_MODEL(entry: Any) -> dict | None:
+def _normalize_model_info(entry: Any) -> dict | None:
     """Convert a Hailo list entry into an Ollama-style model dict."""
     if isinstance(entry, str):
         name = entry
@@ -403,7 +438,7 @@ def _extract_model_list(raw: Any) -> list[dict]:
     else:
         entries = []
 
-    models = [_normalize_HAILO_DEFAULT_MODEL(e) for e in entries]
+    models = [_normalize_model_info(e) for e in entries]
     return [m for m in models if m]
 
 
@@ -468,6 +503,7 @@ async def _stream_ollama(body: bytes, model: str) -> AsyncIterator[str]:
 @app.post("/v1/chat/completions")
 @app.post("/api/chat/completions")
 async def chat_completions(request: Request) -> Any:
+    """Serve OpenAI chat completions, defaulting requests to non-streaming."""
     try:
         body, is_stream, model = _build_payload(
             await request.json(), default_stream=False,
@@ -478,6 +514,8 @@ async def chat_completions(request: Request) -> Any:
             )
         hailo_response = await _post_hailo(body)
         return _openai_full_response(_extract_content(hailo_response), model)
+    except httpx.HTTPStatusError as exc:
+        return _upstream_error_response(exc)
     except Exception as exc:
         logger.exception("Error in chat adapter")
         return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -516,12 +554,16 @@ async def api_show(request: Request) -> dict:
 
 @app.post("/api/chat")
 async def api_chat(request: Request) -> Any:
+    """Serve Ollama chat requests, defaulting to NDJSON streaming."""
     body, is_stream, model = _build_payload(
         await request.json(), default_stream=True,
     )
-    if is_stream:
-        return StreamingResponse(
-            _stream_ollama(body, model), media_type="application/x-ndjson",
-        )
-    hailo_response = await _post_hailo(body)
+    try:
+        if is_stream:
+            return StreamingResponse(
+                _stream_ollama(body, model), media_type="application/x-ndjson"
+            )
+        hailo_response = await _post_hailo(body)
+    except httpx.HTTPStatusError as exc:
+        return _upstream_error_response(exc)
     return _ollama_full_response(_extract_content(hailo_response), model)
