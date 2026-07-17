@@ -85,8 +85,11 @@ async def _preload_models_with_retry() -> None:
                 await asyncio.sleep(STARTUP_RETRY_DELAY)
                 continue
             logger.warning(
-                f"Hailo-Ollama still unreachable after %d attempts. Check hailo-ollama server started and restart or default {HAILO_DEFAULT_MODEL} model will be used",
+                "Hailo-Ollama still unreachable after %d attempts. "
+                "Check hailo-ollama server started and restart or default "
+                "%s model will be used",
                 STARTUP_RETRY_ATTEMPTS,
+                HAILO_DEFAULT_MODEL,
             )
             models = [_DEFAULT_MODEL_INFO]
         else:
@@ -356,7 +359,7 @@ def _infer_family(name: str) -> str:
     return name.split(":", 1)[0] if ":" in name else name
 
 
-def _normalize_HAILO_DEFAULT_MODEL(entry: Any) -> dict | None:
+def _normalize_model_info(entry: Any) -> dict | None:
     """Convert a Hailo list entry into an Ollama-style model dict."""
     if isinstance(entry, str):
         name = entry
@@ -403,7 +406,7 @@ def _extract_model_list(raw: Any) -> list[dict]:
     else:
         entries = []
 
-    models = [_normalize_HAILO_DEFAULT_MODEL(e) for e in entries]
+    models = [_normalize_model_info(e) for e in entries]
     return [m for m in models if m]
 
 
