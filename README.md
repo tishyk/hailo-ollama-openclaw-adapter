@@ -30,7 +30,7 @@ is close to, but not quite, Ollama-compatible. This adapter sits between
 them on port 11435 and translates:
 
 - OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
-- adapter -> Hailo (sanitized JSON, model list from `/hailo/v1/list`)
+- adapter -> Hailo (sanitized JSON, model list from `/api/tags`)
 
 It also handles three Hailo 5.3.0 changes that would otherwise break the
 conversation: strict JSON parsing (control chars rejected), newline-in-
@@ -56,13 +56,25 @@ around Hailo Model Zoo GenAI 5.3.0 and the OpenClaw 2026.4.x series:
   conversation continuations all became hard errors rather than being
   silently tolerated. The old adapter had no sanitization for any of
   these because they hadn't mattered on 5.1.x / 5.2.x.
-- **Dynamic model discovery.** This version queries `/hailo/v1/list` at startup,
+- **Dynamic model discovery.** This version queries `/api/tags` at startup,
   caches the result, and exposes the full set during the openclaw model setup.
 - **Backpressure handled at the app layer.** The old adapter relied on
   uvicorn's `--limit-concurrency` for backpressure, which 503'd probe
   endpoints during OpenClaw's startup burst of `/api/show` calls. This
-  version uses an `asyncio.Semaphore` that gates only the chat path;
-  probes always succeed from the in-memory cache.
+  version uses a one-permit `asyncio.Semaphore` that serializes only the
+  chat path; probes always succeed from the in-memory cache.
+- **Disconnect-safe hardware ownership.** Non-streaming calls run in tracked,
+  shielded workers, while streaming calls use a detached drain task. A client
+  disconnect therefore cannot release the one Hailo generation slot early.
+  Ambiguous in-flight transport failures quarantine chat traffic until the
+  adapter restarts.
+- **Native errors stay errors.** Non-success Hailo chat responses preserve
+  their HTTP status and a bounded explicit error message instead of being
+  converted into a successful empty assistant answer. If a stream fails after
+  HTTP 200 is committed, the adapter emits a protocol error record and omits
+  normal completion framing. Only a native JSON-boolean `done: true` marker is
+  authoritative; clean EOF without that marker is treated as a truncated
+  stream and quarantines later chat traffic.
 - **Graceful streaming shutdown.** Hailo's ~13-second generation
   timeout used to surface as a 100-line ASGI traceback. Now it's caught
   and logged as a single warning.
@@ -106,7 +118,7 @@ Start the Hailo-Ollama server per Hailo's documentation. Verify it's
 listening on port 8000:
 
 ```bash
-curl -s http://127.0.0.1:8000/hailo/v1/list
+curl -s http://127.0.0.1:8000/api/tags
 ```
 
 You should get a list of models for a pull including default `qwen3:1.7b`.
@@ -126,7 +138,7 @@ The pull streams progress until it finishes. To pull additional models,
 repeat with a different `model` value. Verify what's available:
 
 ```bash
-curl -s http://127.0.0.1:8000/hailo/v1/list
+curl -s http://127.0.0.1:8000/api/tags
 ```
 
 ### 3. Install OpenClaw 2026.04.20
@@ -245,7 +257,7 @@ curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
 ```
 
 If Hailo-Ollama is still starting when the adapter launches, the adapter
-retries up to 10 times with 2-second delays before falling back to a
+retries up to 5 times with 3-second delays before falling back to a
 single default model entry. You can force a refresh at any time:
 
 ```bash
@@ -334,7 +346,7 @@ Once configured, each time you want to use OpenClaw with Hailo:
 
 ```bash
 # 1. Make sure Hailo-Ollama is running on port 8000
-curl -s http://127.0.0.1:8000/hailo/v1/list  # quick health check
+curl -s http://127.0.0.1:8000/api/tags  # quick health check
 
 # 2. Terminal 1: start the adapter
 source ~/hailo-ollama-openclaw-adapter/venv/bin/activate
@@ -371,40 +383,47 @@ Edit these constants at the top of `src/hailo_ollama_adapter/adapter.py`
 (or fork and patch to taste):
 
 ```python
-HAILO_MODEL = "qwen3:1.7b"          # fallback when Hailo is unreachable
+HAILO_DEFAULT_MODEL = "qwen3:1.7b"  # fallback when Hailo is unreachable
 HAILO_URL = "http://127.0.0.1:8000/api/chat"
-HAILO_LIST_URL = "http://127.0.0.1:8000/hailo/v1/list"
+HAILO_LIST_URL = "http://127.0.0.1:8000/api/tags"
 
 REQUEST_TIMEOUT = 180.0             # seconds for a single Hailo chat call
 LIST_TIMEOUT = 5.0                  # seconds for the list probe
-STARTUP_RETRY_ATTEMPTS = 10         # how many times to retry at boot
-STARTUP_RETRY_DELAY = 2.0           # seconds between retries
-MAX_USER_CONTENT_CHARS = 4000       # truncate long user messages
+STARTUP_RETRY_ATTEMPTS = 5          # how many times to retry at boot
+STARTUP_RETRY_DELAY = 3.0           # seconds between retries
+MAX_USER_CONTENT_CHARS = 2000       # truncate long user messages
 MAX_EXTRACTED_INTENT_CHARS = 500    # OpenClaw bootstrap envelope trim
-MAX_HISTORY_TURNS = 6               # how many prior turns to keep
+MAX_HISTORY_TURNS = 7               # how many prior turns to keep
 MAX_CONCURRENT_HAILO_CALLS = 2      # app-level backpressure
 ```
 
 The concurrency limit is enforced inside the adapter with an
 `asyncio.Semaphore` - probe endpoints (`/api/tags`, `/api/show`) aren't
 subject to it and always respond instantly from cache. Only the chat
-path is gated.
+path is gated. If a client disconnects, a tracked background worker keeps the
+permit until Hailo finishes. If an accepted request ends with an ambiguous
+transport failure, the adapter returns `503` for later chat calls. Confirm that
+Hailo is idle (restart Hailo-Ollama if necessary), then restart the adapter to
+clear that quarantine. Connection-establishment failures happen before Hailo
+accepts work, so they do not quarantine the adapter.
 
 ---
 
 ## Troubleshooting
 
-**`Hailo-Ollama still unreachable after 10 attempts`** - The adapter
+**`Hailo-Ollama still unreachable after 5 attempts`** - The adapter
 started before Hailo-Ollama was ready. Either start Hailo-Ollama first
 or `POST /api/tags/refresh` once Hailo is up.
 
 **OpenClaw dashboard shows only one model** - The adapter is serving its
-fallback. Check `curl http://127.0.0.1:8000/hailo/v1/list` returns your
+fallback. Check `curl http://127.0.0.1:8000/api/tags` returns your
 pulled models, then `POST /api/tags/refresh` on the adapter.
 
 **`peer closed connection without sending complete message body`** -
 Hailo's internal generation timeout fired (around 13 seconds with heavy
 context). Reduce `MAX_HISTORY_TURNS` or switch to a smaller/faster model.
+The adapter quarantines chat traffic after this ambiguous in-flight failure;
+confirm Hailo is idle, then restart the adapter.
 
 **`[Bootstrap pending]` scaffolding keeps appearing in replies** - Delete
 `~/.openclaw/workspace/BOOTSTRAP.md` after onboarding. OpenClaw treats
@@ -426,11 +445,11 @@ ruff check src/
 # Auto-fix style issues
 ruff check --fix src/
 
-# Run tests (when added)
+# Run tests
 pytest
 ```
 
-The adapter passes the following ruff rule sets clean:
+The configured Ruff rule sets are:
 `E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, `SIM`, `G`.
 
 ---
