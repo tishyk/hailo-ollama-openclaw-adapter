@@ -257,7 +257,7 @@ curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
 ```
 
 If Hailo-Ollama is still starting when the adapter launches, the adapter
-retries up to 10 times with 2-second delays before falling back to a
+retries up to 5 times with 3-second delays before falling back to a
 single default model entry. You can force a refresh at any time:
 
 ```bash
@@ -389,13 +389,12 @@ HAILO_LIST_URL = "http://127.0.0.1:8000/api/tags"
 
 REQUEST_TIMEOUT = 180.0             # seconds for a single Hailo chat call
 LIST_TIMEOUT = 5.0                  # seconds for the list probe
-STARTUP_RETRY_ATTEMPTS = 10         # how many times to retry at boot
-STARTUP_RETRY_DELAY = 2.0           # seconds between retries
+STARTUP_RETRY_ATTEMPTS = 5          # how many times to retry at boot
+STARTUP_RETRY_DELAY = 3.0           # seconds between retries
 MAX_USER_CONTENT_CHARS = 2000       # truncate long user messages
 MAX_EXTRACTED_INTENT_CHARS = 500    # OpenClaw bootstrap envelope trim
-MAX_HISTORY_TURNS = 12              # how many prior turns to keep
-MAX_CONCURRENT_HAILO_CALLS = 1      # Hailo's single generation slot
-MAX_STREAM_QUEUE_CHUNKS = 16         # bounded downstream handoff buffer
+MAX_HISTORY_TURNS = 7               # how many prior turns to keep
+MAX_CONCURRENT_HAILO_CALLS = 2      # app-level backpressure
 ```
 
 The concurrency limit is enforced inside the adapter with an
@@ -412,7 +411,7 @@ accepts work, so they do not quarantine the adapter.
 
 ## Troubleshooting
 
-**`Hailo-Ollama still unreachable after 10 attempts`** - The adapter
+**`Hailo-Ollama still unreachable after 5 attempts`** - The adapter
 started before Hailo-Ollama was ready. Either start Hailo-Ollama first
 or `POST /api/tags/refresh` once Hailo is up.
 
@@ -451,7 +450,7 @@ pytest
 ```
 
 The configured Ruff rule sets are:
-`E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, and `SIM`.
+`E`, `W`, `F`, `I`, `N`, `UP`, `B`, `C4`, `SIM`, `G`.
 
 ---
 
