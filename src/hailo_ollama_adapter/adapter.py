@@ -19,7 +19,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # --------------------------------------------------------------------------- #
@@ -834,6 +834,53 @@ async def chat_completions(request: Request) -> Any:
     except Exception as exc:
         logger.exception("Error in chat adapter")
         return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/models")
+@app.get("/v1/models")
+@app.get("/api/v1/models")
+async def list_models() -> dict:
+    """List available models (OpenAI-compatible endpoint)."""
+    models = await _get_models()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model["name"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "hailo",
+                "permission": [],
+                "root": model["name"],
+                "parent": None,
+            }
+            for model in models
+        ],
+    }
+
+
+@app.get("/models/{model_id}")
+@app.get("/v1/models/{model_id}")
+@app.get("/api/v1/models/{model_id}")
+async def get_model(model_id: str) -> dict:
+    """Return a single model object matching model_id (OpenAI-compatible).
+
+    Uses the internal _get_models() cache and matches against the model's
+    "name" or "model" fields. Returns 404 when not found.
+    """
+    models = await _get_models()
+    for model in models:
+        if model.get("name") == model_id or model.get("model") == model_id:
+            return {
+                "id": model["name"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "hailo",
+                "permission": [],
+                "root": model["name"],
+                "parent": None,
+            }
+    raise HTTPException(status_code=404, detail="Model not found")
 
 
 # --------------------------------------------------------------------------- #
