@@ -61,8 +61,20 @@ around Hailo Model Zoo GenAI 5.3.0 and the OpenClaw 2026.4.x series:
 - **Backpressure handled at the app layer.** The old adapter relied on
   uvicorn's `--limit-concurrency` for backpressure, which 503'd probe
   endpoints during OpenClaw's startup burst of `/api/show` calls. This
-  version uses an `asyncio.Semaphore` that gates only the chat path;
-  probes always succeed from the in-memory cache.
+  version uses a one-permit `asyncio.Semaphore` that serializes only the
+  chat path; probes always succeed from the in-memory cache.
+- **Disconnect-safe hardware ownership.** Non-streaming calls run in tracked,
+  shielded workers, while streaming calls use a detached drain task. A client
+  disconnect therefore cannot release the one Hailo generation slot early.
+  Ambiguous in-flight transport failures quarantine chat traffic until the
+  adapter restarts.
+- **Native errors stay errors.** Non-success Hailo chat responses preserve
+  their HTTP status and a bounded explicit error message instead of being
+  converted into a successful empty assistant answer. If a stream fails after
+  HTTP 200 is committed, the adapter emits a protocol error record and omits
+  normal completion framing. Only a native JSON-boolean `done: true` marker is
+  authoritative; clean EOF without that marker is treated as a truncated
+  stream and quarantines later chat traffic.
 - **Graceful streaming shutdown.** Hailo's ~13-second generation
   timeout used to surface as a 100-line ASGI traceback. Now it's caught
   and logged as a single warning.
@@ -388,7 +400,12 @@ MAX_CONCURRENT_HAILO_CALLS = 2      # app-level backpressure
 The concurrency limit is enforced inside the adapter with an
 `asyncio.Semaphore` - probe endpoints (`/api/tags`, `/api/show`) aren't
 subject to it and always respond instantly from cache. Only the chat
-path is gated.
+path is gated. If a client disconnects, a tracked background worker keeps the
+permit until Hailo finishes. If an accepted request ends with an ambiguous
+transport failure, the adapter returns `503` for later chat calls. Confirm that
+Hailo is idle (restart Hailo-Ollama if necessary), then restart the adapter to
+clear that quarantine. Connection-establishment failures happen before Hailo
+accepts work, so they do not quarantine the adapter.
 
 ---
 
@@ -405,6 +422,8 @@ pulled models, then `POST /api/tags/refresh` on the adapter.
 **`peer closed connection without sending complete message body`** -
 Hailo's internal generation timeout fired (around 13 seconds with heavy
 context). Reduce `MAX_HISTORY_TURNS` or switch to a smaller/faster model.
+The adapter quarantines chat traffic after this ambiguous in-flight failure;
+confirm Hailo is idle, then restart the adapter.
 
 **`[Bootstrap pending]` scaffolding keeps appearing in replies** - Delete
 `~/.openclaw/workspace/BOOTSTRAP.md` after onboarding. OpenClaw treats

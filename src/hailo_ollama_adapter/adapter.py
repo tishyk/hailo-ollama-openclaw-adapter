@@ -15,7 +15,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from typing import Any
 
 import httpx
@@ -53,6 +53,53 @@ _OPENCLAW_INTENT_RE = re.compile(r"\]\s*([^\n\r]+?)\s*$")
 
 logger = logging.getLogger(__name__)
 _hailo_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HAILO_CALLS)
+_hailo_quarantined = False
+_background_hailo_tasks: set[asyncio.Task[Any]] = set()
+_STREAM_END = object()
+_STREAM_FAILED = object()
+
+
+class HailoQuarantinedError(RuntimeError):
+    """Raised when chat is rejected because Hailo execution state is uncertain."""
+
+
+def _track_hailo_task(task: asyncio.Task[Any]) -> None:
+    """Keep detached hardware workers alive and consume unobserved exceptions."""
+    _background_hailo_tasks.add(task)
+
+    def finished(completed: asyncio.Task[Any]) -> None:
+        """Forget a terminal worker after retrieving any stored exception."""
+        _background_hailo_tasks.discard(completed)
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(finished)
+
+
+def _ensure_hailo_available() -> None:
+    """Reject new chat work while the backend state is quarantined."""
+    if _hailo_quarantined:
+        raise HailoQuarantinedError(
+            "Hailo adapter is quarantined after an ambiguous in-flight request "
+            "failure; confirm the backend is idle, then restart the adapter"
+        )
+
+
+def _is_ambiguous_transport_error(exc: httpx.RequestError) -> bool:
+    """Return whether Hailo may have accepted work before the failure."""
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def _quarantine_hailo(reason: str) -> None:
+    """Block later chat work after an ambiguous in-flight failure."""
+    global _hailo_quarantined
+    if _hailo_quarantined:
+        return
+    _hailo_quarantined = True
+    logger.error(
+        "Quarantining Hailo chat traffic after ambiguous in-flight failure: reason=%s",
+        reason,
+    )
 
 
 @asynccontextmanager
@@ -302,6 +349,36 @@ def _upstream_error_response(exc: httpx.HTTPStatusError) -> JSONResponse:
 # Hailo client
 # --------------------------------------------------------------------------- #
 
+
+def _upstream_error_detail(response: httpx.Response) -> str:
+    """Extract a bounded explicit error without reflecting arbitrary bodies."""
+    detail: Any = None
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        detail = payload.get("error") or payload.get("detail")
+        if isinstance(detail, dict):
+            detail = detail.get("message")
+
+    if not isinstance(detail, str) or not detail.strip():
+        return f"Hailo upstream returned HTTP {response.status_code}"
+
+    return _flatten_newlines(_sanitize(detail)).strip()[:MAX_UPSTREAM_ERROR_CHARS]
+
+
+def _upstream_error_response(exc: httpx.HTTPStatusError) -> JSONResponse:
+    """Preserve Hailo's status with a bounded downstream error response."""
+    status = exc.response.status_code
+    logger.warning("Hailo upstream rejected chat request: status=%d", status)
+    return JSONResponse(
+        status_code=status,
+        content={"error": _upstream_error_detail(exc.response)},
+    )
+
+
 def _build_payload(
     request_data: dict,
     default_stream: bool,
@@ -332,32 +409,231 @@ async def _post_hailo(body: bytes) -> dict:
     return response.json()
 
 
-async def _stream_hailo_lines(body: bytes) -> AsyncIterator[dict]:
-    """Stream parsed JSON objects from Hailo, skipping malformed lines.
-
-    Swallows disconnect errors (client hangup, Hailo closing the stream
-    without a clean chunked terminator, timeouts) so the generator ends
-    cleanly instead of propagating exceptions up through ASGI.
-    """
+async def _post_hailo_worker(body: bytes) -> dict:
+    """Run the local request, quarantining uncertainty before releasing the slot."""
     try:
-        async with _hailo_semaphore, httpx.AsyncClient() as client, client.stream(
-            "POST",
-            HAILO_URL,
-            content=body,
-            headers=HAILO_HEADERS,
+        try:
+            return await asyncio.wait_for(
+                _post_hailo_request(body),
+                timeout=REQUEST_TIMEOUT,
+            )
+        except httpx.RequestError as exc:
+            if _is_ambiguous_transport_error(exc):
+                _quarantine_hailo(type(exc).__name__)
+            raise
+        except asyncio.TimeoutError:
+            _quarantine_hailo("request_deadline")
+            raise
+        except asyncio.CancelledError:
+            _quarantine_hailo("request_worker_cancelled")
+            raise
+    finally:
+        _hailo_semaphore.release()
+
+
+async def _post_hailo(body: bytes) -> dict:
+    """Acquire the chat slot and shield its worker from caller cancellation."""
+    await _acquire_hailo_slot()
+    task = asyncio.create_task(_post_hailo_worker(body))
+    _track_hailo_task(task)
+    return await asyncio.shield(task)
+
+
+async def _publish_stream_item(
+    queue: asyncio.Queue[object],
+    consumer_done: asyncio.Event,
+    item: object,
+) -> bool:
+    """Publish with bounded backpressure, or stop after downstream disconnect."""
+    if consumer_done.is_set():
+        return False
+
+    put_task = asyncio.create_task(queue.put(item))
+    done_task = asyncio.create_task(consumer_done.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {put_task, done_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if done_task in done:
+            return False
+        await put_task
+        return True
+    finally:
+        for task in (put_task, done_task):
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def _drain_hailo_lines(
+    response: Any,
+    queue: asyncio.Queue[object],
+    consumer_done: asyncio.Event,
+) -> bool:
+    """Drain until authoritative completion or EOF, discarding after disconnect."""
+    deliver = True
+    async for line in response.aiter_lines():
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if deliver:
+            deliver = await _publish_stream_item(queue, consumer_done, item)
+        if isinstance(item, dict) and item.get("done") is True:
+            return True
+    return False
+
+
+async def _pump_hailo_lines(
+    response: Any,
+    resources: AsyncExitStack,
+    queue: asyncio.Queue[object],
+    consumer_done: asyncio.Event,
+) -> None:
+    """Drain one accepted Hailo stream while retaining the hardware slot."""
+    failed = False
+    completed = False
+    try:
+        completed = await asyncio.wait_for(
+            _drain_hailo_lines(response, queue, consumer_done),
             timeout=REQUEST_TIMEOUT,
-        ) as response:
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout) as exc:
-        logger.warning("Hailo stream ended early: %s", exc)
+        )
+        if not completed:
+            failed = True
+            _quarantine_hailo("stream_eof_before_done")
+            logger.warning("Hailo stream ended before its completion marker")
+    except httpx.RequestError as exc:
+        failed = True
+        if _is_ambiguous_transport_error(exc):
+            _quarantine_hailo(type(exc).__name__)
+        logger.warning(
+            "Hailo stream ended early: error_class=%s",
+            type(exc).__name__,
+        )
+    except asyncio.TimeoutError:
+        failed = True
+        _quarantine_hailo("stream_deadline")
+        logger.warning("Hailo stream exceeded its total deadline")
+    except asyncio.CancelledError:
+        failed = True
+        _quarantine_hailo("stream_worker_cancelled")
+        raise
     except Exception:
+        failed = True
+        _quarantine_hailo("stream_worker_failure")
         logger.exception("Unexpected error streaming from Hailo")
+    finally:
+        try:
+            await _close_hailo_stream_resources(
+                resources,
+                quarantine_on_failure=not completed,
+            )
+        finally:
+            _hailo_semaphore.release()
+        if not consumer_done.is_set():
+            terminal = _STREAM_FAILED if failed else _STREAM_END
+            await _publish_stream_item(queue, consumer_done, terminal)
+
+
+async def _consume_hailo_queue(
+    queue: asyncio.Queue[object],
+    consumer_done: asyncio.Event,
+) -> AsyncIterator[object]:
+    """Yield queued stream items and signal when the downstream consumer stops."""
+    try:
+        while True:
+            item = await queue.get()
+            if item is _STREAM_END:
+                return
+            yield item
+            if item is _STREAM_FAILED:
+                return
+    finally:
+        consumer_done.set()
+
+
+async def _close_hailo_stream_resources(
+    resources: AsyncExitStack,
+    *,
+    quarantine_on_failure: bool = True,
+) -> None:
+    """Close upstream resources and quarantine ambiguous cleanup failures."""
+    try:
+        await resources.aclose()
+    except Exception as exc:
+        if quarantine_on_failure:
+            _quarantine_hailo("stream_close_failure")
+        logger.error(
+            "Failed to close Hailo stream resources: error_class=%s",
+            type(exc).__name__,
+        )
+
+
+async def _start_hailo_stream(body: bytes) -> AsyncIterator[object]:
+    """Acquire the slot and validate upstream status before committing HTTP 200."""
+    await _acquire_hailo_slot()
+    resources = AsyncExitStack()
+    try:
+        client = await resources.enter_async_context(httpx.AsyncClient())
+        response = await resources.enter_async_context(
+            client.stream(
+                "POST",
+                HAILO_URL,
+                content=body,
+                headers=HAILO_HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+        )
+        response.raise_for_status()
+    except httpx.RequestError as exc:
+        if _is_ambiguous_transport_error(exc):
+            _quarantine_hailo(type(exc).__name__)
+        try:
+            await _close_hailo_stream_resources(resources)
+        finally:
+            _hailo_semaphore.release()
+        raise
+    except asyncio.CancelledError:
+        _quarantine_hailo("stream_start_cancelled")
+        try:
+            await _close_hailo_stream_resources(resources)
+        finally:
+            _hailo_semaphore.release()
+        raise
+    except BaseException:
+        try:
+            await _close_hailo_stream_resources(resources)
+        finally:
+            _hailo_semaphore.release()
+        raise
+
+    queue: asyncio.Queue[object] = asyncio.Queue(MAX_STREAM_QUEUE_CHUNKS)
+    consumer_done = asyncio.Event()
+    task = asyncio.create_task(
+        _pump_hailo_lines(response, resources, queue, consumer_done)
+    )
+    _track_hailo_task(task)
+    return _consume_hailo_queue(queue, consumer_done)
+
+
+async def _stream_hailo_lines(body: bytes) -> AsyncIterator[object]:
+    """Stream parsed Hailo objects while a detached worker owns the slot.
+
+    If the downstream client disconnects, the worker keeps draining Hailo so a
+    second request cannot overlap generation on the single hardware slot.
+    """
+    stream = await _start_hailo_stream(body)
+    try:
+        async for item in stream:
+            yield item
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 def _extract_content(hailo_json: dict) -> str:
@@ -474,25 +750,63 @@ async def _get_model_details(name: str) -> dict:
 # Streaming generators
 # --------------------------------------------------------------------------- #
 
-async def _stream_openai(body: bytes, model: str) -> AsyncIterator[str]:
-    yield to_openai_chunk("", model, is_meta=True)
-    async for chunk in _stream_hailo_lines(body):
-        content = _extract_content(chunk)
-        if content:
-            yield to_openai_chunk(content, model)
-        if chunk.get("done"):
-            yield to_openai_chunk("", model, finish_reason="stop")
-    yield "data: [DONE]\n\n"
+async def _stream_openai(
+    chunks: AsyncIterator[object], model: str
+) -> AsyncIterator[str]:
+    """Translate Hailo stream items into OpenAI-compatible SSE framing."""
+    try:
+        yield to_openai_chunk("", model, is_meta=True)
+        async for chunk in chunks:
+            if chunk is _STREAM_FAILED:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "error": {
+                                "message": "Hailo upstream stream failed",
+                                "type": "upstream_error",
+                                "code": "hailo_stream_failed",
+                            }
+                        }
+                    )
+                    + "\n\n"
+                )
+                return
+            if not isinstance(chunk, dict):
+                continue
+            content = _extract_content(chunk)
+            if content:
+                yield to_openai_chunk(content, model)
+            if chunk.get("done") is True:
+                yield to_openai_chunk("", model, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
-async def _stream_ollama(body: bytes, model: str) -> AsyncIterator[str]:
-    async for chunk in _stream_hailo_lines(body):
-        yield json.dumps({
-            "model": model,
-            "created_at": f"{int(time.time())}",
-            "message": {"role": "assistant", "content": _extract_content(chunk)},
-            "done": bool(chunk.get("done", False)),
-        }) + "\n"
+async def _stream_ollama(
+    chunks: AsyncIterator[object], model: str
+) -> AsyncIterator[str]:
+    """Translate Hailo stream items into Ollama-compatible NDJSON framing."""
+    try:
+        async for chunk in chunks:
+            if chunk is _STREAM_FAILED:
+                yield json.dumps({"error": "Hailo upstream stream failed"}) + "\n"
+                return
+            if not isinstance(chunk, dict):
+                continue
+            yield json.dumps({
+                "model": model,
+                "created_at": f"{int(time.time())}",
+                "message": {"role": "assistant", "content": _extract_content(chunk)},
+                "done": chunk.get("done") is True,
+            }) + "\n"
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 # --------------------------------------------------------------------------- #
@@ -509,8 +823,9 @@ async def chat_completions(request: Request) -> Any:
             await request.json(), default_stream=False,
         )
         if is_stream:
+            chunks = await _start_hailo_stream(body)
             return StreamingResponse(
-                _stream_openai(body, model), media_type="text/event-stream",
+                _stream_openai(chunks, model), media_type="text/event-stream",
             )
         hailo_response = await _post_hailo(body)
         return _openai_full_response(_extract_content(hailo_response), model)
