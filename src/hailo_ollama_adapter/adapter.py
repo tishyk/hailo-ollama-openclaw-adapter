@@ -40,6 +40,7 @@ MAX_EXTRACTED_INTENT_CHARS = 500
 MAX_HISTORY_TURNS = 7
 MAX_CONCURRENT_HAILO_CALLS = 2
 MAX_UPSTREAM_ERROR_CHARS = 500
+MAX_STREAM_QUEUE_CHUNKS = 100
 
 FULL_TOOLING = """Tools available for this request:
 - read: Read file contents
@@ -316,35 +317,6 @@ def _ollama_full_response(content: str, model: str) -> dict:
     }
 
 
-def _upstream_error_detail(response: httpx.Response) -> str:
-    """Extract a bounded explicit error without reflecting arbitrary bodies."""
-    detail: Any = None
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, ValueError):
-        payload = None
-
-    if isinstance(payload, dict):
-        detail = payload.get("error") or payload.get("detail")
-        if isinstance(detail, dict):
-            detail = detail.get("message")
-
-    if not isinstance(detail, str) or not detail.strip():
-        return f"Hailo upstream returned HTTP {response.status_code}"
-
-    return _flatten_newlines(_sanitize(detail)).strip()[:MAX_UPSTREAM_ERROR_CHARS]
-
-
-def _upstream_error_response(exc: httpx.HTTPStatusError) -> JSONResponse:
-    """Preserve Hailo's status with a bounded downstream error response."""
-    status = exc.response.status_code
-    logger.warning("Hailo upstream rejected chat request: status=%d", status)
-    return JSONResponse(
-        status_code=status,
-        content={"error": _upstream_error_detail(exc.response)},
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Hailo client
 # --------------------------------------------------------------------------- #
@@ -396,9 +368,15 @@ def _build_payload(
     return body, is_stream, model_name
 
 
-async def _post_hailo(body: bytes) -> dict:
-    """Send one non-streaming request while holding the Hailo chat slot."""
-    async with _hailo_semaphore, httpx.AsyncClient() as client:
+async def _acquire_hailo_slot() -> None:
+    """Reject quarantined traffic, then acquire a concurrency slot."""
+    _ensure_hailo_available()
+    await _hailo_semaphore.acquire()
+
+
+async def _post_hailo_request(body: bytes) -> dict:
+    """Send one non-streaming request to Hailo (slot managed by the caller)."""
+    async with httpx.AsyncClient() as client:
         response = await client.post(
             HAILO_URL,
             content=body,
@@ -916,14 +894,15 @@ async def api_show(request: Request) -> dict:
 
 @app.post("/api/chat")
 async def api_chat(request: Request) -> Any:
-    """Serve Ollama chat requests, defaulting to NDJSON streaming."""
+    """ Serve Ollama chat requests, defaulting to NDJSON streaming."""
     body, is_stream, model = _build_payload(
         await request.json(), default_stream=True,
     )
     try:
         if is_stream:
+            chunks = await _start_hailo_stream(body)
             return StreamingResponse(
-                _stream_ollama(body, model), media_type="application/x-ndjson",
+                _stream_ollama(chunks, model), media_type="application/x-ndjson",
             )
         hailo_response = await _post_hailo(body)
     except httpx.HTTPStatusError as exc:
